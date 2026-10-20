@@ -78,15 +78,18 @@ module tb_i2c_cpld_switch;
         m0_read_bit(b); ack=(b==1'b0);
     end endtask
 
-    task m0_read_byte; output [7:0] data; input nack; integer i; reg b;
+    task m0_read_byte; output [7:0] data; input nack; output ack_line; integer i; reg b;
     begin
         for(i=7;i>=0;i=i-1) begin
             m0_read_bit(b); data[i]=b;
         end
-        m0_write_bit(nack);
+        scl_m0=0; m0_low=(nack==1'b0); i2c_wait;
+        scl_m0=1; i2c_wait; ack_line=sda_m0;
+        scl_m0=0; i2c_wait;
     end endtask
 
     reg ack;
+    reg ack_line;
     reg [7:0] rdata;
     integer err;
 
@@ -109,9 +112,10 @@ module tb_i2c_cpld_switch;
         m0_write_byte(8'h01, ack); if(!ack) err=err+1;
         m0_low=0; scl_m0=1; i2c_wait; m0_low=1; i2c_wait; scl_m0=0; i2c_wait;
         m0_write_byte(8'hFF, ack); if(!ack) err=err+1;
-        m0_read_byte(rdata, 1'b1);
+        m0_read_byte(rdata, 1'b1, ack_line);
         m0_stop();
         if(rdata!==8'h8A) err=err+1;
+        if(ack_line!==1'b1) err=err+1;
 
         $display("TB DONE err=%0d", err);
         if(err==0) $display("PASS"); else $display("FAIL");
