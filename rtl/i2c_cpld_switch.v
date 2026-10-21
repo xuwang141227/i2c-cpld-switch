@@ -91,6 +91,17 @@ module i2c_cpld_switch #(
     wire cur_sda_m = (active_master_sel==1'b0) ? sda_m0_i     : sda_m1_i;
 
     reg [7:0] slave_port_sel;
+    reg [2:0] phase;
+    reg [3:0] bit_cnt;
+    reg [7:0] shreg;
+    reg       internal_hit;
+    localparam PH_ADDR_E = 3'd1;
+    // Internal (slave-port register) access is detected from the address byte:
+    // after 7 address bits equal 0x7F the slave side is blocked immediately
+    // (before the R/W bit), and stays blocked via internal_hit afterwards.
+    wire addr_internal_early = (phase==PH_ADDR_E) && (bit_cnt==4'd7) && (shreg[6:0]==7'h7F);
+    wire internal_access = internal_hit | addr_internal_early;
+    wire slave_path_en = selected_slave_en && !internal_access;
     wire selected_slave_en = (slave_port_sel[3:0] >= 4'h8);
     wire [2:0] slave_idx   = slave_port_sel[2:0];
 
@@ -108,14 +119,15 @@ module i2c_cpld_switch #(
         endcase
     end
 
-    assign scl_slave0 = (selected_slave_en && slave_idx==3'd0) ? cur_scl_m : 1'b1;
-    assign scl_slave1 = (selected_slave_en && slave_idx==3'd1) ? cur_scl_m : 1'b1;
-    assign scl_slave2 = (selected_slave_en && slave_idx==3'd2) ? cur_scl_m : 1'b1;
-    assign scl_slave3 = (selected_slave_en && slave_idx==3'd3) ? cur_scl_m : 1'b1;
-    assign scl_slave4 = (selected_slave_en && slave_idx==3'd4) ? cur_scl_m : 1'b1;
-    assign scl_slave5 = (selected_slave_en && slave_idx==3'd5) ? cur_scl_m : 1'b1;
-    assign scl_slave6 = (selected_slave_en && slave_idx==3'd6) ? cur_scl_m : 1'b1;
-    assign scl_slave7 = (selected_slave_en && slave_idx==3'd7) ? cur_scl_m : 1'b1;
+    // slave_path_en is defined after the FSM declarations (see below)
+    assign scl_slave0 = (slave_path_en && slave_idx==3'd0) ? cur_scl_m : 1'b1;
+    assign scl_slave1 = (slave_path_en && slave_idx==3'd1) ? cur_scl_m : 1'b1;
+    assign scl_slave2 = (slave_path_en && slave_idx==3'd2) ? cur_scl_m : 1'b1;
+    assign scl_slave3 = (slave_path_en && slave_idx==3'd3) ? cur_scl_m : 1'b1;
+    assign scl_slave4 = (slave_path_en && slave_idx==3'd4) ? cur_scl_m : 1'b1;
+    assign scl_slave5 = (slave_path_en && slave_idx==3'd5) ? cur_scl_m : 1'b1;
+    assign scl_slave6 = (slave_path_en && slave_idx==3'd6) ? cur_scl_m : 1'b1;
+    assign scl_slave7 = (slave_path_en && slave_idx==3'd7) ? cur_scl_m : 1'b1;
 
     reg cur_scl_d, cur_sda_d;
     always @(posedge clk or negedge reset_n) begin
@@ -140,13 +152,9 @@ module i2c_cpld_switch #(
     localparam PH_IDLE=3'd0, PH_ADDR=3'd1, PH_ACK1=3'd2, PH_REG=3'd3,
                PH_ACK2=3'd4, PH_DATA=3'd5, PH_ACK3=3'd6;
 
-    reg [2:0] phase;
-    reg [3:0] bit_cnt;
-    reg [7:0] shreg;
     reg [7:0] reg_addr;
     reg [7:0] reg_rdata;
     reg       rw_bit;
-    reg       internal_hit;
     reg       in_txn;
     reg       bypass_dir_s2m;
     reg       ack_started;
@@ -323,23 +331,23 @@ module i2c_cpld_switch #(
     wire int_rdat_low = (internal_hit && rw_bit && phase==PH_DATA && (reg_rdata[7-bit_cnt]==1'b0));
     wire int_drive_master_low = int_ack1_low | int_ack2_low | int_ack3_low | int_rdat_low;
 
-    wire bypass_en   = (!internal_hit) && selected_slave_en;
+    wire bypass_en   = slave_path_en;
     wire ext_s2m_low = bypass_en && (bypass_dir_s2m==1'b1) && (cur_sda_s==1'b0);
     wire ext_m2s_low = bypass_en && (bypass_dir_s2m==1'b0) && (cur_sda_m==1'b0);
 
     wire drive_master_low = internal_hit ? int_drive_master_low : ext_s2m_low;
-    wire drive_slave_low  = (!internal_hit) && ext_m2s_low;
+    wire drive_slave_low  = ext_m2s_low;
 
     assign sda_master0 = ((active_master_sel==1'b0) && drive_master_low) ? 1'b0 : 1'bz;
     assign sda_master1 = ((active_master_sel==1'b1) && drive_master_low) ? 1'b0 : 1'bz;
 
-    assign sda_slave0 = (selected_slave_en && slave_idx==3'd0 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave1 = (selected_slave_en && slave_idx==3'd1 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave2 = (selected_slave_en && slave_idx==3'd2 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave3 = (selected_slave_en && slave_idx==3'd3 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave4 = (selected_slave_en && slave_idx==3'd4 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave5 = (selected_slave_en && slave_idx==3'd5 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave6 = (selected_slave_en && slave_idx==3'd6 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave7 = (selected_slave_en && slave_idx==3'd7 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave0 = (slave_path_en && slave_idx==3'd0 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave1 = (slave_path_en && slave_idx==3'd1 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave2 = (slave_path_en && slave_idx==3'd2 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave3 = (slave_path_en && slave_idx==3'd3 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave4 = (slave_path_en && slave_idx==3'd4 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave5 = (slave_path_en && slave_idx==3'd5 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave6 = (slave_path_en && slave_idx==3'd6 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave7 = (slave_path_en && slave_idx==3'd7 && drive_slave_low) ? 1'b0 : 1'bz;
 
 endmodule
