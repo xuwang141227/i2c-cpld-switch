@@ -30,8 +30,12 @@
   - 写数据阶段：master -> slave
   - ACK/读数据阶段：slave -> master
 - 内部事务（地址命中 `0x7F`）：
-  - CPLD 内部驱动 ACK/读数据到 master
-  - 屏蔽外部 slave SDA 驱动，避免并驱动
+  - 不再在检测到 `1111111` 地址位后屏蔽 slave；当前选中端口接收完整的 START、8-bit 地址（含 R/W）、ACK、数据、重复 START 和 STOP，SCL 始终透传。
+  - CPLD 内部驱动 ACK/读数据到 master，同时以开漏方式转发到当前 slave：master SDA 为低**或**内部应答需要拉低时，slave SDA 拉低；否则释放，不需要两者同时为低。
+  - 内部访问期间不把外部 slave SDA 回传给 master，避免内部应答经双向路径回授、自锁。普通外部事务仍按原来的方向控制双向透传。
+  - `0x01` 写入先暂存，直到 STOP 才更新端口选择；重复 START 不切换端口。因此同一组合事务始终发送到旧端口，STOP 前读回的选择值仍为旧值；新端口从 STOP 后的下一次事务开始接收。
+  - 未使能任何 slave 时，内部寄存器仍可访问，所有 slave SCL 保持高、SDA 释放。
+  - 下游设备应避免使用 CPLD 的内部地址 `0x7F`；内部访问的返回值由 CPLD 提供，不支持同地址设备的应答仲裁。SCL 为单向输出，不支持下游 clock stretching。
 
 ## 参数
 - `CLK_FREQ_HZ`：内部逻辑时钟
@@ -73,8 +77,13 @@ TB 内含 8 个 I2C slave 行为模型（地址 `0x50`，256 字节存储，指�
 | E7 | 重新选择 slave port | 旧 slave 不再收到流量 |
 | E8 | 异步复位 | `slave_port_sel`、`active_master_sel` 回到 0 |
 
-### 已知现象（RTL 未改动）
-内部事务（地址 `0x7F`）的 START 与地址阶段在地址译码前会短暂透传到“之前选中”的 slave（该 slave 因地址不匹配不会 ACK）。TB 因此在配置 slave port 之后再统计“其它 slave 无流量”。
+### 4. 内部命令完整透传（2 master × 8 slave）
+- 检查选中端口完整的写/读波形、地址 R/W 位、内部 ACK/读数据、master NACK 与 STOP；其它端口及非活动 master 保持空闲。
+- 逐位核对总线内容，检查写事务的 27 个时钟、组合读事务的完整时钟及唯一 STOP。
+- 写新端口选择后紧接重复 START，检查旧端口接收完整组合事务，直到 STOP 才切换；其它端口不接收半条命令。
+- 检查禁用端口后内部寄存器仍能正常访问。
+
+配置命令本身也完整发送到“之前选中”的 slave（普通下游设备因地址不匹配不会 ACK）。TB 因此在配置 slave port 之后再统计“其它 slave 无流量”。
 
 ### 仿真结果
-当前 Icarus Verilog 仿真：`pass=194 fail=0`，`PASS`。
+当前 Icarus Verilog 仿真：`pass=471 fail=0`，`PASS`。

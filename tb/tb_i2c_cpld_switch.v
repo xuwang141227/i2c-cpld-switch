@@ -109,8 +109,18 @@ module tb_i2c_cpld_switch;
     pullup(sda_s[0]); pullup(sda_s[1]); pullup(sda_s[2]); pullup(sda_s[3]);
     pullup(sda_s[4]); pullup(sda_s[5]); pullup(sda_s[6]); pullup(sda_s[7]);
 
+    integer scl_count [0:7];
+    integer stop_count [0:7];
+    reg [63:0] bus_bits [0:7];
     genvar g;
     generate for (g = 0; g < 8; g = g + 1) begin : gs
+        initial begin scl_count[g] = 0; stop_count[g] = 0; bus_bits[g] = 0; end
+        always @(posedge scl_s[g]) begin
+            scl_count[g] = scl_count[g] + 1;
+            bus_bits[g] = {bus_bits[g][62:0], sda_s[g]};
+        end
+        always @(posedge sda_s[g])
+            if (scl_s[g] === 1'b1) stop_count[g] = stop_count[g] + 1;
         i2c_slave_model #(.ADDR(7'h50), .ID(8'hC0 + g)) u (
             .scl(scl_s[g]), .sda(sda_s[g]),
             .txn_cnt(txn_flat[g*16 +: 16]), .wr_cnt(wrc_flat[g*16 +: 16]),
@@ -207,8 +217,30 @@ module tb_i2c_cpld_switch;
     function [15:0] wrc; input integer idx; begin wrc = wrc_flat[idx*16 +: 16]; end endfunction
     function [7:0] lastw; input integer idx; begin lastw = lastw_flat[idx*8 +: 8]; end endfunction
 
+    reg watch_internal;
+    integer watch_port, watch_master, wave_errors, j;
+    integer clocks_before, stops_before;
+    reg [7:0] expected_scl;
+    // Check settled levels throughout the transaction, including ACK and STOP.
+    always @(negedge clk) begin
+        #1;
+        if (watch_internal) begin
+            expected_scl = 8'hFF;
+            expected_scl[watch_port] = watch_master ? scl_m1 : scl_m0;
+            if (scl_s !== expected_scl) wave_errors = wave_errors + 1;
+            if (sda_s[watch_port] !== get_sda(watch_master))
+                wave_errors = wave_errors + 1;
+            for (j = 0; j < 8; j = j + 1)
+                if (j != watch_port && sda_s[j] !== 1'b1)
+                    wave_errors = wave_errors + 1;
+            if ((watch_master ? sda_m0 : sda_m1) !== 1'b1)
+                wave_errors = wave_errors + 1;
+        end
+    end
+
     initial begin
         pass_cnt = 0; fail_cnt = 0;
+        watch_internal = 0; wave_errors = 0;
         reset_n = 0; i2c_master_sel = 0; scl_m0 = 1; scl_m1 = 1; m_low = 2'b00;
         #1000; reset_n = 1; #2000;
 
@@ -238,7 +270,7 @@ module tb_i2c_cpld_switch;
         m_wbyte(0, 8'h01, a1);
         m_wbyte(0, 8'h8F, a2);
         check(dut.slave_port_sel === 8'h5A, "port selector unchanged before STOP");
-        check(dut.internal_hit && scl_s === 8'hFF, "internal access isolated through final ACK");
+        check(dut.internal_hit && scl_s === 8'hFB, "internal access forwarded through ACK");
         m_stop(0); hp;
         check(dut.slave_port_sel === 8'h8F, "port selector updated after STOP");
 
@@ -250,7 +282,7 @@ module tb_i2c_cpld_switch;
                 sel_master(m);
                 check(dut.active_master_sel === m[0], "active master switched");
                 // 经当前 master 配置 slave port
-                // (内部事务的 START/地址阶段会短暂透传到旧 slave, 故在配置完成后再统计流量)
+                // (内部事务完整透传到旧 slave，故在配置完成后再统计流量)
                 wr_reg(m, CPLD, 8'h01, 8'h88 + s);
                 rd_reg(m, CPLD, 8'h01);
                 check(rd_val === 8'h88 + s, "select reg readback");
@@ -353,7 +385,67 @@ module tb_i2c_cpld_switch;
         check(lastw(5) === 8'hE5, "data to slave5");
         check(txn(4) === txn_before[4], "slave4 untouched after re-select");
 
+        // ============================================================
+        $display("\n===== TEST 4: 内部命令完整透传及 STOP 切换 =====");
+        for (m = 0; m < 2; m = m + 1) begin
+            sel_master(m);
+            for (s = 0; s < 8; s = s + 1) begin
+                wr_reg(m, CPLD, 8'h01, 8'h88 + s);
+                watch_port = s; watch_master = m; wave_errors = 0;
+                clocks_before = scl_count[s]; stops_before = stop_count[s];
+                watch_internal = 1;
+                // Write the same port so the monitor can include STOP.
+                wr_reg(m, CPLD, 8'h01, 8'h88 + s);
+                watch_internal = 0;
+                check(wave_errors == 0, "internal write waveform on selected port");
+                check(scl_count[s] - clocks_before == 28, "write has 27 clocks plus STOP setup");
+                check(stop_count[s] - stops_before == 1, "write delivers exactly one STOP");
+                check(bus_bits[s][27:0] === {8'hFE, 1'b0, 8'h01, 1'b0,
+                      (8'h88 + s[7:0]), 1'b0, 1'b0}, "write forwards address data and ACKs");
+                clocks_before = scl_count[s]; stops_before = stop_count[s];
+                wave_errors = 0; watch_internal = 1;
+                rd_reg(m, CPLD, 8'h01);
+                watch_internal = 0;
+                check(wave_errors == 0, "internal read waveform on selected port");
+                check(rd_val === 8'h88 + s, "forwarded read retains internal data");
+                check(scl_count[s] - clocks_before == 38, "read forwards all clocks including Sr");
+                check(stop_count[s] - stops_before == 1, "read delivers exactly one STOP");
+                check(bus_bits[s][37:0] === {8'hFE, 1'b0, 8'h01, 1'b0,
+                      1'b1, 8'hFF, 1'b0, (8'h88 + s[7:0]), 1'b1, 1'b0},
+                      "read forwards internal data and NACK");
+                // A new selection must not split a combined transaction.
+                clocks_before = scl_count[s]; stops_before = stop_count[s];
+                for (i = 0; i < 8; i = i + 1) txn_before[i] = txn(i);
+                wave_errors = 0; watch_internal = 1;
+                m_start(m);
+                m_wbyte(m, 8'hFE, a0); m_wbyte(m, 8'h01, a1);
+                exp_d = 8'h88 + ((s + 1) % 8);
+                m_wbyte(m, exp_d, a2);
+                check(a0 && a1 && a2, "selection write ACKs before Sr");
+                check(dut.slave_port_sel === 8'h88 + s, "old route retained before Sr");
+                m_start(m);
+                m_wbyte(m, 8'hFF, a0);
+                m_rbyte(m, rd_val, 1'b1);
+                check(rd_val === 8'h88 + s, "selection unchanged across repeated START");
+                m_stop(m); hp;
+                watch_internal = 0;
+                check(wave_errors == 0, "old port receives combined transaction");
+                check(scl_count[s] - clocks_before == 47, "combined command clocks complete");
+                check(stop_count[s] - stops_before == 1, "old port receives final STOP");
+                check(dut.slave_port_sel === exp_d, "new route applied only after STOP");
+                n = 0;
+                for (i = 0; i < 8; i = i + 1)
+                    if (i != s && txn(i) !== txn_before[i]) n = n + 1;
+                check(n == 0, "no partial command on other ports");
+            end
+        end
+        wr_reg(1, CPLD, 8'h01, 8'h03);
+        rd_reg(1, CPLD, 8'h01);
+        check(rd_val === 8'h03 && a0 && a1 && a2, "internal access works with port disabled");
+        check(scl_s === 8'hFF && sda_s === 8'hFF, "disabled ports remain released");
+
         $display("--- E8: 异步复位后 slave_port_sel 回到 0x00 ---");
+        i2c_master_sel = 0;
         reset_n = 0; #200; reset_n = 1; #2000;
         check(dut.slave_port_sel === 8'h00, "reset clears select");
         check(dut.active_master_sel === 1'b0, "reset clears active master");

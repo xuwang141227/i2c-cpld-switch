@@ -95,14 +95,8 @@ module i2c_cpld_switch #(
     reg [3:0] bit_cnt;
     reg [7:0] shreg;
     reg       internal_hit;
-    localparam PH_ADDR_E = 3'd1;
-    // Internal (slave-port register) access is detected from the address byte:
-    // after 7 address bits equal 0x7F the slave side is blocked immediately
-    // (before the R/W bit), and stays blocked via internal_hit afterwards.
-    wire addr_internal_early = (phase==PH_ADDR_E) && (bit_cnt==4'd7) && (shreg[6:0]==7'h7F);
-    wire internal_access = internal_hit | addr_internal_early;
-    wire slave_path_en = selected_slave_en && !internal_access;
     wire selected_slave_en = (slave_port_sel[3:0] >= 4'h8);
+    wire slave_path_en = selected_slave_en;
     wire [2:0] slave_idx   = slave_port_sel[2:0];
 
     reg cur_sda_s;
@@ -119,7 +113,6 @@ module i2c_cpld_switch #(
         endcase
     end
 
-    // slave_path_en is defined after the FSM declarations (see below)
     assign scl_slave0 = (slave_path_en && slave_idx==3'd0) ? cur_scl_m : 1'b1;
     assign scl_slave1 = (slave_path_en && slave_idx==3'd1) ? cur_scl_m : 1'b1;
     assign scl_slave2 = (slave_path_en && slave_idx==3'd2) ? cur_scl_m : 1'b1;
@@ -178,10 +171,6 @@ module i2c_cpld_switch #(
             slave_port_sel <= 8'h00;
         end else begin
             if(start_cond) begin
-                if(slave_port_sel_update_pending) begin
-                    slave_port_sel <= pending_slave_port_sel;
-                    slave_port_sel_update_pending <= 1'b0;
-                end
                 in_txn <= 1'b1;
                 phase <= PH_ADDR;
                 bit_cnt <= 4'd0;
@@ -350,7 +339,10 @@ module i2c_cpld_switch #(
     wire ext_m2s_low = bypass_en && (bypass_dir_s2m==1'b0) && (cur_sda_m==1'b0);
 
     wire drive_master_low = internal_hit ? int_drive_master_low : ext_s2m_low;
-    wire drive_slave_low  = ext_m2s_low;
+    // Internal replies go to both buses, without feeding slave SDA back to master.
+    wire drive_slave_low  = internal_hit ?
+                            (slave_path_en && (!cur_sda_m || int_drive_master_low)) :
+                            ext_m2s_low;
 
     assign sda_master0 = ((active_master_sel==1'b0) && drive_master_low) ? 1'b0 : 1'bz;
     assign sda_master1 = ((active_master_sel==1'b1) && drive_master_low) ? 1'b0 : 1'bz;
