@@ -233,6 +233,14 @@ module tb_i2c_cpld_switch;
         wr_reg(0, CPLD, 8'h01, 8'h5A); rd_reg(0, CPLD, 8'h01);
         $display("  WRITE 0x5A -> READ 0x%02h", rd_val);
         check(rd_val === 8'h5A, "reg0x01 pattern 0x5A");
+        m_start(0);
+        m_wbyte(0, {CPLD, 1'b0}, a0);
+        m_wbyte(0, 8'h01, a1);
+        m_wbyte(0, 8'h8F, a2);
+        check(dut.slave_port_sel === 8'h5A, "port selector unchanged before STOP");
+        check(dut.internal_hit && scl_s === 8'hFF, "internal access isolated through final ACK");
+        m_stop(0); hp;
+        check(dut.slave_port_sel === 8'h8F, "port selector updated after STOP");
 
         // ============================================================
         $display("\n===== TEST 2: 2 master x 8 slave = 16 case 透传读写 =====");
