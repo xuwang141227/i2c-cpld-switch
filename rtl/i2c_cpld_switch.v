@@ -158,6 +158,8 @@ module i2c_cpld_switch #(
     reg       in_txn;
     reg       bypass_dir_s2m;
     reg       ack_started;
+    reg [7:0] pending_slave_port_sel;
+    reg       slave_port_sel_update_pending;
 
     always @(posedge clk or negedge reset_n) begin
         if(!reset_n) begin
@@ -171,9 +173,15 @@ module i2c_cpld_switch #(
             in_txn <= 1'b0;
             bypass_dir_s2m <= 1'b0;
             ack_started <= 1'b0;
+            pending_slave_port_sel <= 8'h00;
+            slave_port_sel_update_pending <= 1'b0;
             slave_port_sel <= 8'h00;
         end else begin
             if(start_cond) begin
+                if(slave_port_sel_update_pending) begin
+                    slave_port_sel <= pending_slave_port_sel;
+                    slave_port_sel_update_pending <= 1'b0;
+                end
                 in_txn <= 1'b1;
                 phase <= PH_ADDR;
                 bit_cnt <= 4'd0;
@@ -184,6 +192,10 @@ module i2c_cpld_switch #(
             end
 
             if(stop_cond) begin
+                if(slave_port_sel_update_pending) begin
+                    slave_port_sel <= pending_slave_port_sel;
+                    slave_port_sel_update_pending <= 1'b0;
+                end
                 in_txn <= 1'b0;
                 phase <= PH_IDLE;
                 bit_cnt <= 4'd0;
@@ -270,7 +282,10 @@ module i2c_cpld_switch #(
                                     shreg <= {shreg[6:0], cur_sda_m};
                                     bit_cnt <= bit_cnt + 1'b1;
                                     if(bit_cnt==4'd7) begin
-                                        if(reg_addr==8'h01) slave_port_sel <= {shreg[6:0], cur_sda_m};
+                                        if(reg_addr==8'h01) begin
+                                            pending_slave_port_sel <= {shreg[6:0], cur_sda_m};
+                                            slave_port_sel_update_pending <= 1'b1;
+                                        end
                                         phase <= PH_ACK3;
                                         bit_cnt <= 4'd0;
                                         ack_started <= 1'b0;
@@ -309,7 +324,6 @@ module i2c_cpld_switch #(
                                 if(internal_hit) begin
                                     phase <= PH_IDLE;
                                     in_txn <= 1'b0;
-                                    internal_hit <= 1'b0;
                                     bypass_dir_s2m <= 1'b0;
                                 end else begin
                                     phase <= PH_DATA;
