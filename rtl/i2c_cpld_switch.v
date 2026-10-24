@@ -2,7 +2,8 @@
 module i2c_cpld_switch #(
     parameter integer CLK_FREQ_HZ     = 50_000_000,
     parameter integer I2C_SPEED_HZ    = 100_000,
-    parameter integer IDLE_FILTER_CYC = 8
+    parameter integer IDLE_FILTER_CYC = 8,
+    parameter integer SDA_RELEASE_CYC = (CLK_FREQ_HZ / 1_000_000) + 2
 )(
     input  wire        clk,
     input  wire        reset_n,
@@ -119,7 +120,6 @@ module i2c_cpld_switch #(
         endcase
     end
 
-    // slave_path_en is defined after the FSM declarations (see below)
     assign scl_slave0 = (slave_path_en && slave_idx==3'd0) ? cur_scl_m : 1'b1;
     assign scl_slave1 = (slave_path_en && slave_idx==3'd1) ? cur_scl_m : 1'b1;
     assign scl_slave2 = (slave_path_en && slave_idx==3'd2) ? cur_scl_m : 1'b1;
@@ -128,6 +128,60 @@ module i2c_cpld_switch #(
     assign scl_slave5 = (slave_path_en && slave_idx==3'd5) ? cur_scl_m : 1'b1;
     assign scl_slave6 = (slave_path_en && slave_idx==3'd6) ? cur_scl_m : 1'b1;
     assign scl_slave7 = (slave_path_en && slave_idx==3'd7) ? cur_scl_m : 1'b1;
+
+    localparam DIR_IDLE=2'd0, DIR_MASTER=2'd1, DIR_SLAVE=2'd2, DIR_RELEASE=2'd3;
+    reg [1:0] dir_state;
+    reg [7:0] sda_m_samples, sda_s_samples;
+    integer release_cnt;
+
+    always @(posedge clk or negedge reset_n) begin
+        if(!reset_n) begin
+            dir_state <= DIR_RELEASE;
+            sda_m_samples <= 8'hFF;
+            sda_s_samples <= 8'hFF;
+            release_cnt <= 0;
+        end else if(!slave_path_en) begin
+            dir_state <= DIR_RELEASE;
+            sda_m_samples <= 8'hFF;
+            sda_s_samples <= 8'hFF;
+            release_cnt <= 0;
+        end else begin
+            sda_m_samples <= {sda_m_samples[6:0], cur_sda_m};
+            sda_s_samples <= {sda_s_samples[6:0], cur_sda_s};
+            case(dir_state)
+                DIR_IDLE: begin
+                    if(sda_m_samples==8'h00) dir_state <= DIR_MASTER;
+                    else if(sda_s_samples==8'h00) dir_state <= DIR_SLAVE;
+                end
+                DIR_MASTER: begin
+                    if(&sda_m_samples[2:1]) begin
+                        dir_state <= DIR_RELEASE;
+                        release_cnt <= 0;
+                    end
+                end
+                DIR_SLAVE: begin
+                    if(&sda_s_samples[2:1]) begin
+                        dir_state <= DIR_RELEASE;
+                        release_cnt <= 0;
+                    end
+                end
+                DIR_RELEASE: begin
+                    // Both outputs stay released while the old destination rises.
+                    // Discard its reflected-low history before choosing a new source.
+                    sda_m_samples <= 8'hFF;
+                    sda_s_samples <= 8'hFF;
+                    if(release_cnt >= SDA_RELEASE_CYC-1) begin
+                        dir_state <= DIR_IDLE;
+                        release_cnt <= 0;
+                    end else release_cnt <= release_cnt + 1;
+                end
+                default: begin
+                    dir_state <= DIR_RELEASE;
+                    release_cnt <= 0;
+                end
+            endcase
+        end
+    end
 
     reg cur_scl_d, cur_sda_d;
     always @(posedge clk or negedge reset_n) begin
@@ -156,7 +210,7 @@ module i2c_cpld_switch #(
     reg [7:0] reg_rdata;
     reg       rw_bit;
     reg       in_txn;
-    reg       bypass_dir_s2m;
+    reg       reg_addr_valid;
     reg       ack_started;
     reg [7:0] pending_slave_port_sel;
     reg       slave_port_sel_update_pending;
@@ -171,13 +225,16 @@ module i2c_cpld_switch #(
             rw_bit <= 1'b0;
             internal_hit <= 1'b0;
             in_txn <= 1'b0;
-            bypass_dir_s2m <= 1'b0;
+            reg_addr_valid <= 1'b0;
             ack_started <= 1'b0;
             pending_slave_port_sel <= 8'h00;
             slave_port_sel_update_pending <= 1'b0;
             slave_port_sel <= 8'h00;
         end else begin
             if(start_cond) begin
+                if(!in_txn) begin
+                    reg_addr_valid <= 1'b0;
+                end
                 if(slave_port_sel_update_pending) begin
                     slave_port_sel <= pending_slave_port_sel;
                     slave_port_sel_update_pending <= 1'b0;
@@ -187,7 +244,6 @@ module i2c_cpld_switch #(
                 bit_cnt <= 4'd0;
                 shreg <= 8'h00;
                 internal_hit <= 1'b0;
-                bypass_dir_s2m <= 1'b0;
                 ack_started <= 1'b0;
             end
 
@@ -199,10 +255,10 @@ module i2c_cpld_switch #(
                 in_txn <= 1'b0;
                 phase <= PH_IDLE;
                 bit_cnt <= 4'd0;
+                reg_addr_valid <= 1'b0;
                 internal_hit <= 1'b0;
-                bypass_dir_s2m <= 1'b0;
                 ack_started <= 1'b0;
-            end else if(in_txn) begin
+            end else if(in_txn && !start_cond) begin
                 case(phase)
                     PH_ADDR: begin
                         if(scl_rise) begin
@@ -223,21 +279,22 @@ module i2c_cpld_switch #(
                         if(scl_fall) begin
                             if(!ack_started) begin
                                 ack_started <= 1'b1;
-                                if(!internal_hit) bypass_dir_s2m <= 1'b1;
                             end else begin
                                 ack_started <= 1'b0;
                                 if(internal_hit) begin
                                     if(rw_bit) begin
-                                        phase <= PH_DATA;
-                                        if(reg_addr==8'h01) reg_rdata <= slave_port_sel;
-                                        else                reg_rdata <= 8'h00;
+                                        if(reg_addr_valid) begin
+                                            phase <= PH_DATA;
+                                            if(reg_addr==8'h01) reg_rdata <= slave_port_sel;
+                                            else                reg_rdata <= 8'h00;
+                                        end else begin
+                                            phase <= PH_IDLE;
+                                        end
                                     end else begin
                                         phase <= PH_REG;
                                     end
-                                    bypass_dir_s2m <= 1'b0;
                                 end else begin
-                                    phase <= PH_DATA;
-                                    bypass_dir_s2m <= rw_bit;
+                                    phase <= PH_IDLE;
                                 end
                             end
                         end
@@ -249,6 +306,7 @@ module i2c_cpld_switch #(
                             bit_cnt <= bit_cnt + 1'b1;
                             if(bit_cnt==4'd7) begin
                                 reg_addr <= {shreg[6:0], cur_sda_m};
+                                reg_addr_valid <= 1'b1;
                                 phase <= PH_ACK2;
                                 bit_cnt <= 4'd0;
                                 ack_started <= 1'b0;
@@ -260,16 +318,12 @@ module i2c_cpld_switch #(
                         if(scl_fall) begin
                             if(!ack_started) begin
                                 ack_started <= 1'b1;
-                                bypass_dir_s2m <= 1'b1;
                             end else begin
                                 ack_started <= 1'b0;
                                 phase <= PH_DATA;
                                 if(rw_bit) begin
                                     if(reg_addr==8'h01) reg_rdata <= slave_port_sel;
                                     else                reg_rdata <= 8'h00;
-                                    bypass_dir_s2m <= 1'b1;
-                                end else begin
-                                    bypass_dir_s2m <= 1'b0;
                                 end
                             end
                         end
@@ -301,16 +355,6 @@ module i2c_cpld_switch #(
                                     end
                                 end
                             end
-                        end else begin
-                            if((!rw_bit && scl_rise) || (rw_bit && scl_fall)) begin
-                                bit_cnt <= bit_cnt + 1'b1;
-                                if(bit_cnt==4'd7) begin
-                                    phase <= PH_ACK3;
-                                    bit_cnt <= 4'd0;
-                                    ack_started <= rw_bit;
-                                    if(rw_bit) bypass_dir_s2m <= 1'b0;
-                                end
-                            end
                         end
                     end
 
@@ -318,16 +362,11 @@ module i2c_cpld_switch #(
                         if(scl_fall) begin
                             if(!ack_started) begin
                                 ack_started <= 1'b1;
-                                if(!internal_hit) bypass_dir_s2m <= rw_bit ? 1'b0 : 1'b1;
                             end else begin
                                 ack_started <= 1'b0;
                                 if(internal_hit) begin
                                     phase <= PH_IDLE;
                                     in_txn <= 1'b0;
-                                    bypass_dir_s2m <= 1'b0;
-                                end else begin
-                                    phase <= PH_DATA;
-                                    bypass_dir_s2m <= rw_bit;
                                 end
                             end
                         end
@@ -345,12 +384,14 @@ module i2c_cpld_switch #(
     wire int_rdat_low = (internal_hit && rw_bit && phase==PH_DATA && (reg_rdata[7-bit_cnt]==1'b0));
     wire int_drive_master_low = int_ack1_low | int_ack2_low | int_ack3_low | int_rdat_low;
 
-    wire bypass_en   = slave_path_en;
-    wire ext_s2m_low = bypass_en && (bypass_dir_s2m==1'b1) && (cur_sda_s==1'b0);
-    wire ext_m2s_low = bypass_en && (bypass_dir_s2m==1'b0) && (cur_sda_m==1'b0);
+    // Only the originating side is sampled for release while forwarding a low.
+    wire external_master_to_slave = slave_path_en && (dir_state==DIR_MASTER);
+    wire external_slave_to_master = slave_path_en && (dir_state==DIR_SLAVE);
+    wire external_slave_sda_low = external_master_to_slave && (cur_sda_m==1'b0);
+    wire external_master_sda_low = external_slave_to_master && (cur_sda_s==1'b0);
 
-    wire drive_master_low = internal_hit ? int_drive_master_low : ext_s2m_low;
-    wire drive_slave_low  = ext_m2s_low;
+    wire drive_master_low = internal_hit ? int_drive_master_low : external_master_sda_low;
+    wire drive_slave_low  = external_slave_sda_low;
 
     assign sda_master0 = ((active_master_sel==1'b0) && drive_master_low) ? 1'b0 : 1'bz;
     assign sda_master1 = ((active_master_sel==1'b1) && drive_master_low) ? 1'b0 : 1'bz;
