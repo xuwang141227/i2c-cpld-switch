@@ -93,7 +93,10 @@ module i2c_slave_model #(
 endmodule
 
 
-module tb_i2c_cpld_switch;
+module tb_i2c_cpld_switch #(
+    parameter integer SDA_RISE_NS = 0,
+    parameter integer HP = 3333
+);
 
     reg clk, reset_n, i2c_master_sel;
     reg scl_m0, scl_m1;
@@ -104,6 +107,7 @@ module tb_i2c_cpld_switch;
     pullup(sda_m0); pullup(sda_m1);
 
     wire [7:0] scl_s, sda_s;
+    reg [7:0] slave_test_low;
     wire [8*16-1:0] txn_flat, wrc_flat;
     wire [8*8-1:0]  lastw_flat;
     pullup(sda_s[0]); pullup(sda_s[1]); pullup(sda_s[2]); pullup(sda_s[3]);
@@ -111,11 +115,25 @@ module tb_i2c_cpld_switch;
 
     genvar g;
     generate for (g = 0; g < 8; g = g + 1) begin : gs
+        assign sda_s[g] = slave_test_low[g] ? 1'b0 : 1'bz;
         i2c_slave_model #(.ADDR(7'h50), .ID(8'hC0 + g)) u (
             .scl(scl_s[g]), .sda(sda_s[g]),
             .txn_cnt(txn_flat[g*16 +: 16]), .wr_cnt(wrc_flat[g*16 +: 16]),
             .last_wdata(lastw_flat[g*8 +: 8]));
+        // Hold SDA low for the configured rise time after all real drivers release.
+        wire released;
+        assign #(SDA_RISE_NS, 0) released =
+            !(slave_test_low[g] || u.low ||
+              (dut.slave_path_en && dut.slave_idx==g && dut.drive_slave_low));
+        assign sda_s[g] = released ? 1'bz : 1'b0;
     end endgenerate
+    wire m0_released, m1_released;
+    assign #(SDA_RISE_NS, 0) m0_released =
+        !(m_low[0] || (!dut.active_master_sel && dut.drive_master_low));
+    assign #(SDA_RISE_NS, 0) m1_released =
+        !(m_low[1] || (dut.active_master_sel && dut.drive_master_low));
+    assign sda_m0 = m0_released ? 1'bz : 1'b0;
+    assign sda_m1 = m1_released ? 1'bz : 1'b0;
 
     i2c_cpld_switch #(.CLK_FREQ_HZ(50_000_000), .I2C_SPEED_HZ(100_000), .IDLE_FILTER_CYC(8)) dut (
         .clk(clk), .reset_n(reset_n), .i2c_master_sel(i2c_master_sel),
@@ -144,10 +162,10 @@ module tb_i2c_cpld_switch;
     // ------------------------------------------------------------------
     // I2C master 驱动（m=0/1 选择 master）
     // ------------------------------------------------------------------
-    localparam HP = 5000;
     task hp; begin #HP; end endtask
-    task set_scl; input m; input v; begin if (m) scl_m1 = v; else scl_m0 = v; end endtask
-    task set_sda; input m; input v; begin m_low[m] = (v == 1'b0); end endtask
+    // Nonblocking pin updates avoid races when a bit-bang edge coincides with clk.
+    task set_scl; input m; input v; begin if (m) scl_m1 <= v; else scl_m0 <= v; end endtask
+    task set_sda; input m; input v; begin m_low[m] <= (v == 1'b0); end endtask
     function get_sda; input m; begin get_sda = m ? sda_m1 : sda_m0; end endfunction
 
     task m_start; input m; begin      // 兼容 repeated START
@@ -182,7 +200,7 @@ module tb_i2c_cpld_switch;
         m_wbyte(m, {dev, 1'b0}, a0); m_wbyte(m, r, a1); m_wbyte(m, d, a2);
         m_stop(m); hp;
     end endtask
-    // 读寄存器：START, addr_w, reg, Sr, addr_r, data(NACK), STOP
+    // Standard register read: address+W, index, repeated START, address+R, data(NACK).
     reg [7:0] rd_val;
     task rd_reg; input m; input [6:0] dev; input [7:0] r; begin
         m_start(m);
@@ -209,6 +227,7 @@ module tb_i2c_cpld_switch;
 
     initial begin
         pass_cnt = 0; fail_cnt = 0;
+        slave_test_low = 8'h00;
         reset_n = 0; i2c_master_sel = 0; scl_m0 = 1; scl_m1 = 1; m_low = 2'b00;
         #1000; reset_n = 1; #2000;
 
@@ -233,6 +252,16 @@ module tb_i2c_cpld_switch;
         wr_reg(0, CPLD, 8'h01, 8'h5A); rd_reg(0, CPLD, 8'h01);
         $display("  WRITE 0x5A -> READ 0x%02h", rd_val);
         check(rd_val === 8'h5A, "reg0x01 pattern 0x5A");
+        rd_reg(0, CPLD, 8'h01);
+        check(a0 && a1 && a2, "new-format internal read ACKs address, index, and repeated address");
+        check(rd_val === 8'h5A, "new-format internal read returns selected register");
+        m_start(0);
+        m_wbyte(0, {CPLD, 1'b1}, a0); m_wbyte(0, 8'h01, a1);
+        m_start(0);
+        m_wbyte(0, {CPLD, 1'b1}, a2);
+        m_rbyte(0, rd_val, 1'b1);
+        m_stop(0); hp;
+        check(rd_val === 8'hFF, "read-address-first internal read is not supported");
         m_start(0);
         m_wbyte(0, {CPLD, 1'b0}, a0);
         m_wbyte(0, 8'h01, a1);
@@ -330,6 +359,44 @@ module tb_i2c_cpld_switch;
         check(rd_val === 8'h5C, "master1 reads same data");
         sel_master(0);
 
+        $display("--- E5b: 外部从设备任意多字节命令透传 ---");
+        m_start(0);
+        m_wbyte(0, {SLV, 1'b0}, a0);
+        m_wbyte(0, 8'hD2, a1);
+        m_wbyte(0, 8'h39, a2);
+        m_wbyte(0, 8'hA7, a0);
+        m_stop(0); hp;
+        check(a0 && a1 && a2, "arbitrary external command bytes ACK through bridge");
+        check(lastw(4) === 8'hA7, "arbitrary external payload reaches selected slave");
+
+        $display("--- E5c: SDA direction follows the low source, not byte phase ---");
+        m_start(0);
+        m_wbyte(0, {SLV, 1'b0}, a0);
+        set_sda(0, 1); hp;
+        slave_test_low[4] = 1'b1; hp;
+        check(sda_m0 === 1'b0, "slave low relayed during external write");
+        check(dut.phase == dut.PH_IDLE, "external byte decoding is inactive");
+        set_sda(0, 0); hp;
+        slave_test_low[4] = 1'b0; hp;
+        check(sda_s[4] === 1'b0, "overlapping low hands off slave to master");
+        set_sda(0, 1); hp;
+        check(sda_m0 === 1'b1 && sda_s[4] === 1'b1, "both buses release without feedback");
+        set_sda(0, 0); hp;
+        slave_test_low[4] = 1'b1; hp;
+        set_sda(0, 1); hp;
+        check(sda_m0 === 1'b0, "overlapping low hands off master to slave");
+        slave_test_low[4] = 1'b0; hp;
+        check(sda_m0 === 1'b1 && sda_s[4] === 1'b1, "reverse handoff releases without feedback");
+        if(SDA_RISE_NS==0) begin
+            set_sda(0, 0); #60; set_sda(0, 1); #100;
+            check(sda_s[4] === 1'b1, "short master low is filtered");
+            hp;
+            slave_test_low[4] = 1'b1; #60; slave_test_low[4] = 1'b0; #100;
+            check(sda_m0 === 1'b1, "short slave low is filtered");
+            hp;
+        end
+        m_stop(0); hp;
+
         $display("--- E6: 多字节突发写/读 (指针自增) ---");
         m_start(0);
         m_wbyte(0, {SLV, 1'b0}, a0); m_wbyte(0, 8'h60, a1);
@@ -345,6 +412,32 @@ module tb_i2c_cpld_switch;
         m_rbyte(0, rd_val, 1'b0); $display("  burst rd1=0x%02h", rd_val); check(rd_val === 8'h22, "burst read byte1");
         m_rbyte(0, rd_val, 1'b1); $display("  burst rd2=0x%02h", rd_val); check(rd_val === 8'h33, "burst read byte2");
         m_stop(0); hp;
+
+        $display("--- E6b: both masters relay all 256 byte values ---");
+        for(m = 0; m < 2; m = m + 1) begin
+            sel_master(m);
+            wr_reg(m, CPLD, 8'h01, 8'h8C);
+            m_start(m);
+            m_wbyte(m, {SLV, 1'b0}, a0); m_wbyte(m, 8'h00, a1);
+            check(a0 && a1, "full-pattern write address and pointer ACK");
+            for(i = 0; i < 256; i = i + 1) begin
+                m_wbyte(m, i[7:0], a2);
+                check(a2, "full-pattern byte write ACK");
+            end
+            m_stop(m); hp;
+            m_start(m);
+            m_wbyte(m, {SLV, 1'b0}, a0); m_wbyte(m, 8'h00, a1);
+            m_start(m);
+            m_wbyte(m, {SLV, 1'b1}, a2);
+            check(a0 && a1 && a2, "full-pattern read address and pointer ACK");
+            for(i = 0; i < 256; i = i + 1) begin
+                m_rbyte(m, rd_val, i == 255);
+                check(rd_val === i[7:0], "full-pattern byte read matches");
+            end
+            m_stop(m); hp;
+            check(get_sda(m) === 1'b1 && sda_s[4] === 1'b1, "full-pattern STOP releases both buses");
+        end
+        sel_master(0);
 
         $display("--- E7: 切换 slave port 后旧 slave 不再收到流量 ---");
         wr_reg(0, CPLD, 8'h01, 8'h8D);  // slave5
