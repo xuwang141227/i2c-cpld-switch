@@ -39,21 +39,44 @@ module i2c_cpld_switch #(
     wire sda_s6_i = sda_slave6;
     wire sda_s7_i = sda_slave7;
 
+    (* ASYNC_REG = "TRUE" *) reg [1:0] scl_meta, scl_sync;
+    (* ASYNC_REG = "TRUE" *) reg [9:0] sda_meta, sda_sync;
+    (* ASYNC_REG = "TRUE" *) reg master_sel_meta, master_sel_sync;
+    always @(posedge clk or negedge reset_n) begin
+        if(!reset_n) begin
+            scl_meta <= 2'b11;
+            scl_sync <= 2'b11;
+            sda_meta <= 10'h3FF;
+            sda_sync <= 10'h3FF;
+            master_sel_meta <= 1'b0;
+            master_sel_sync <= 1'b0;
+        end else begin
+            scl_meta <= {scl_master1, scl_master0};
+            scl_sync <= scl_meta;
+            sda_meta <= {sda_s7_i, sda_s6_i, sda_s5_i, sda_s4_i,
+                         sda_s3_i, sda_s2_i, sda_s1_i, sda_s0_i,
+                         sda_m1_i, sda_m0_i};
+            sda_sync <= sda_meta;
+            master_sel_meta <= i2c_master_sel;
+            master_sel_sync <= master_sel_meta;
+        end
+    end
+
     reg m0_scl_d, m0_sda_d, m1_scl_d, m1_sda_d;
     always @(posedge clk or negedge reset_n) begin
         if(!reset_n) begin
             m0_scl_d <= 1'b1; m0_sda_d <= 1'b1;
             m1_scl_d <= 1'b1; m1_sda_d <= 1'b1;
         end else begin
-            m0_scl_d <= scl_master0; m0_sda_d <= sda_m0_i;
-            m1_scl_d <= scl_master1; m1_sda_d <= sda_m1_i;
+            m0_scl_d <= scl_sync[0]; m0_sda_d <= sda_sync[0];
+            m1_scl_d <= scl_sync[1]; m1_sda_d <= sda_sync[1];
         end
     end
 
-    wire m0_start = (m0_sda_d==1'b1 && sda_m0_i==1'b0 && scl_master0==1'b1);
-    wire m0_stop  = (m0_sda_d==1'b0 && sda_m0_i==1'b1 && scl_master0==1'b1);
-    wire m1_start = (m1_sda_d==1'b1 && sda_m1_i==1'b0 && scl_master1==1'b1);
-    wire m1_stop  = (m1_sda_d==1'b0 && sda_m1_i==1'b1 && scl_master1==1'b1);
+    wire m0_start = m0_sda_d && !sda_sync[0] && m0_scl_d && scl_sync[0];
+    wire m0_stop  = !m0_sda_d && sda_sync[0] && m0_scl_d && scl_sync[0];
+    wire m1_start = m1_sda_d && !sda_sync[1] && m1_scl_d && scl_sync[1];
+    wire m1_stop  = !m1_sda_d && sda_sync[1] && m1_scl_d && scl_sync[1];
 
     reg m0_busy, m1_busy;
     always @(posedge clk or negedge reset_n) begin
@@ -69,8 +92,8 @@ module i2c_cpld_switch #(
         end
     end
 
-    wire m0_idle_level = (scl_master0==1'b1) && (sda_m0_i==1'b1);
-    wire m1_idle_level = (scl_master1==1'b1) && (sda_m1_i==1'b1);
+    wire m0_idle_level = scl_sync[0] && sda_sync[0];
+    wire m1_idle_level = scl_sync[1] && sda_sync[1];
     wire both_idle_now = (!m0_busy) && (!m1_busy) && m0_idle_level && m1_idle_level;
 
     reg [15:0] idle_cnt;
@@ -80,16 +103,17 @@ module i2c_cpld_switch #(
             if(idle_cnt < 16'hffff) idle_cnt <= idle_cnt + 16'd1;
         end else idle_cnt <= 16'd0;
     end
-    wire switch_allowed = (idle_cnt >= IDLE_FILTER_CYC);
+    wire switch_allowed = both_idle_now && (idle_cnt >= IDLE_FILTER_CYC);
 
     reg active_master_sel;
     always @(posedge clk or negedge reset_n) begin
         if(!reset_n) active_master_sel <= 1'b0;
-        else if(switch_allowed) active_master_sel <= i2c_master_sel;
+        else if(switch_allowed) active_master_sel <= master_sel_sync;
     end
 
-    wire cur_scl_m = (active_master_sel==1'b0) ? scl_master0 : scl_master1;
-    wire cur_sda_m = (active_master_sel==1'b0) ? sda_m0_i     : sda_m1_i;
+    wire cur_scl_raw = active_master_sel ? scl_master1 : scl_master0;
+    wire cur_scl_m = scl_sync[active_master_sel];
+    wire cur_sda_m = sda_sync[active_master_sel];
 
     reg [7:0] slave_port_sel;
     reg [2:0] phase;
@@ -109,25 +133,26 @@ module i2c_cpld_switch #(
     reg cur_sda_s;
     always @(*) begin
         case(slave_idx)
-            3'd0: cur_sda_s = sda_s0_i;
-            3'd1: cur_sda_s = sda_s1_i;
-            3'd2: cur_sda_s = sda_s2_i;
-            3'd3: cur_sda_s = sda_s3_i;
-            3'd4: cur_sda_s = sda_s4_i;
-            3'd5: cur_sda_s = sda_s5_i;
-            3'd6: cur_sda_s = sda_s6_i;
-            default: cur_sda_s = sda_s7_i;
+            3'd0: cur_sda_s = sda_sync[2];
+            3'd1: cur_sda_s = sda_sync[3];
+            3'd2: cur_sda_s = sda_sync[4];
+            3'd3: cur_sda_s = sda_sync[5];
+            3'd4: cur_sda_s = sda_sync[6];
+            3'd5: cur_sda_s = sda_sync[7];
+            3'd6: cur_sda_s = sda_sync[8];
+            default: cur_sda_s = sda_sync[9];
         endcase
     end
 
-    assign scl_slave0 = (slave_path_en && slave_idx==3'd0) ? cur_scl_m : 1'b1;
-    assign scl_slave1 = (slave_path_en && slave_idx==3'd1) ? cur_scl_m : 1'b1;
-    assign scl_slave2 = (slave_path_en && slave_idx==3'd2) ? cur_scl_m : 1'b1;
-    assign scl_slave3 = (slave_path_en && slave_idx==3'd3) ? cur_scl_m : 1'b1;
-    assign scl_slave4 = (slave_path_en && slave_idx==3'd4) ? cur_scl_m : 1'b1;
-    assign scl_slave5 = (slave_path_en && slave_idx==3'd5) ? cur_scl_m : 1'b1;
-    assign scl_slave6 = (slave_path_en && slave_idx==3'd6) ? cur_scl_m : 1'b1;
-    assign scl_slave7 = (slave_path_en && slave_idx==3'd7) ? cur_scl_m : 1'b1;
+    // SCL forwarding is combinational; only its synchronized copy enters logic.
+    assign scl_slave0 = (slave_path_en && slave_idx==3'd0) ? cur_scl_raw : 1'b1;
+    assign scl_slave1 = (slave_path_en && slave_idx==3'd1) ? cur_scl_raw : 1'b1;
+    assign scl_slave2 = (slave_path_en && slave_idx==3'd2) ? cur_scl_raw : 1'b1;
+    assign scl_slave3 = (slave_path_en && slave_idx==3'd3) ? cur_scl_raw : 1'b1;
+    assign scl_slave4 = (slave_path_en && slave_idx==3'd4) ? cur_scl_raw : 1'b1;
+    assign scl_slave5 = (slave_path_en && slave_idx==3'd5) ? cur_scl_raw : 1'b1;
+    assign scl_slave6 = (slave_path_en && slave_idx==3'd6) ? cur_scl_raw : 1'b1;
+    assign scl_slave7 = (slave_path_en && slave_idx==3'd7) ? cur_scl_raw : 1'b1;
 
     localparam DIR_IDLE=2'd0, DIR_MASTER=2'd1, DIR_SLAVE=2'd2, DIR_RELEASE=2'd3;
     reg [1:0] dir_state;
@@ -154,13 +179,13 @@ module i2c_cpld_switch #(
                     else if(sda_s_samples==8'h00) dir_state <= DIR_SLAVE;
                 end
                 DIR_MASTER: begin
-                    if(&sda_m_samples[2:1]) begin
+                    if(&sda_m_samples[2:0]) begin
                         dir_state <= DIR_RELEASE;
                         release_cnt <= 0;
                     end
                 end
                 DIR_SLAVE: begin
-                    if(&sda_s_samples[2:1]) begin
+                    if(&sda_s_samples[2:0]) begin
                         dir_state <= DIR_RELEASE;
                         release_cnt <= 0;
                     end
@@ -192,8 +217,8 @@ module i2c_cpld_switch #(
         end
     end
 
-    wire start_cond = (cur_sda_d==1'b1 && cur_sda_m==1'b0 && cur_scl_m==1'b1);
-    wire stop_cond  = (cur_sda_d==1'b0 && cur_sda_m==1'b1 && cur_scl_m==1'b1);
+    wire start_cond = cur_sda_d && !cur_sda_m && cur_scl_d && cur_scl_m;
+    wire stop_cond  = !cur_sda_d && cur_sda_m && cur_scl_d && cur_scl_m;
 
     reg scl_q;
     always @(posedge clk or negedge reset_n) begin
@@ -387,22 +412,37 @@ module i2c_cpld_switch #(
     // Only the originating side is sampled for release while forwarding a low.
     wire external_master_to_slave = slave_path_en && (dir_state==DIR_MASTER);
     wire external_slave_to_master = slave_path_en && (dir_state==DIR_SLAVE);
-    wire external_slave_sda_low = external_master_to_slave && (cur_sda_m==1'b0);
-    wire external_master_sda_low = external_slave_to_master && (cur_sda_s==1'b0);
+    wire external_slave_sda_low = external_master_to_slave;
+    wire external_master_sda_low = external_slave_to_master;
 
-    wire drive_master_low = internal_hit ? int_drive_master_low : external_master_sda_low;
-    wire drive_slave_low  = external_slave_sda_low;
+    reg [1:0] master_sda_low;
+    reg [7:0] slave_sda_low;
+    wire drive_master_low = |master_sda_low;
+    wire drive_slave_low = |slave_sda_low;
+    always @(posedge clk or negedge reset_n) begin
+        if(!reset_n) begin
+            master_sda_low <= 2'b00;
+            slave_sda_low <= 8'h00;
+        end else begin
+            // Register the complete pin enables, including route and internal ACK/data.
+            master_sda_low <= 2'b00;
+            slave_sda_low <= 8'h00;
+            master_sda_low[active_master_sel] <=
+                internal_hit ? int_drive_master_low : external_master_sda_low;
+            slave_sda_low[slave_idx] <= external_slave_sda_low;
+        end
+    end
 
-    assign sda_master0 = ((active_master_sel==1'b0) && drive_master_low) ? 1'b0 : 1'bz;
-    assign sda_master1 = ((active_master_sel==1'b1) && drive_master_low) ? 1'b0 : 1'bz;
+    assign sda_master0 = master_sda_low[0] ? 1'b0 : 1'bz;
+    assign sda_master1 = master_sda_low[1] ? 1'b0 : 1'bz;
 
-    assign sda_slave0 = (slave_path_en && slave_idx==3'd0 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave1 = (slave_path_en && slave_idx==3'd1 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave2 = (slave_path_en && slave_idx==3'd2 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave3 = (slave_path_en && slave_idx==3'd3 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave4 = (slave_path_en && slave_idx==3'd4 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave5 = (slave_path_en && slave_idx==3'd5 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave6 = (slave_path_en && slave_idx==3'd6 && drive_slave_low) ? 1'b0 : 1'bz;
-    assign sda_slave7 = (slave_path_en && slave_idx==3'd7 && drive_slave_low) ? 1'b0 : 1'bz;
+    assign sda_slave0 = slave_sda_low[0] ? 1'b0 : 1'bz;
+    assign sda_slave1 = slave_sda_low[1] ? 1'b0 : 1'bz;
+    assign sda_slave2 = slave_sda_low[2] ? 1'b0 : 1'bz;
+    assign sda_slave3 = slave_sda_low[3] ? 1'b0 : 1'bz;
+    assign sda_slave4 = slave_sda_low[4] ? 1'b0 : 1'bz;
+    assign sda_slave5 = slave_sda_low[5] ? 1'b0 : 1'bz;
+    assign sda_slave6 = slave_sda_low[6] ? 1'b0 : 1'bz;
+    assign sda_slave7 = slave_sda_low[7] ? 1'b0 : 1'bz;
 
 endmodule

@@ -123,15 +123,14 @@ module tb_i2c_cpld_switch #(
         // Hold SDA low for the configured rise time after all real drivers release.
         wire released;
         assign #(SDA_RISE_NS, 0) released =
-            !(slave_test_low[g] || u.low ||
-              (dut.slave_path_en && dut.slave_idx==g && dut.drive_slave_low));
+            !(slave_test_low[g] || u.low || dut.slave_sda_low[g]);
         assign sda_s[g] = released ? 1'bz : 1'b0;
     end endgenerate
     wire m0_released, m1_released;
     assign #(SDA_RISE_NS, 0) m0_released =
-        !(m_low[0] || (!dut.active_master_sel && dut.drive_master_low));
+        !(m_low[0] || dut.master_sda_low[0]);
     assign #(SDA_RISE_NS, 0) m1_released =
-        !(m_low[1] || (dut.active_master_sel && dut.drive_master_low));
+        !(m_low[1] || dut.master_sda_low[1]);
     assign sda_m0 = m0_released ? 1'bz : 1'b0;
     assign sda_m1 = m1_released ? 1'bz : 1'b0;
 
@@ -154,6 +153,20 @@ module tb_i2c_cpld_switch #(
     // 公共：计数、检查
     // ------------------------------------------------------------------
     integer pass_cnt, fail_cnt;
+    integer offclock_sda_changes, simultaneous_drives;
+    integer master0_edges, slave4_edges, edges_before;
+    time last_clk_edge;
+    always @(posedge clk) last_clk_edge = $time;
+    always @(dut.master_sda_low or dut.slave_sda_low) begin
+        if(reset_n) begin
+            if($time != last_clk_edge)
+                offclock_sda_changes = offclock_sda_changes + 1;
+            if((|dut.master_sda_low) && (|dut.slave_sda_low))
+                simultaneous_drives = simultaneous_drives + 1;
+        end
+    end
+    always @(sda_m0) master0_edges = master0_edges + 1;
+    always @(sda_s[4]) slave4_edges = slave4_edges + 1;
     task check; input cond; input [8*40-1:0] name; begin
         if (cond) begin pass_cnt = pass_cnt + 1; $display("  [PASS] %0s", name); end
         else      begin fail_cnt = fail_cnt + 1; $display("  [FAIL] %0s", name); end
@@ -227,9 +240,36 @@ module tb_i2c_cpld_switch #(
 
     initial begin
         pass_cnt = 0; fail_cnt = 0;
+        offclock_sda_changes = 0; simultaneous_drives = 0;
+        master0_edges = 0; slave4_edges = 0;
         slave_test_low = 8'h00;
         reset_n = 0; i2c_master_sel = 0; scl_m0 = 1; scl_m1 = 1; m_low = 2'b00;
         #1000; reset_n = 1; #2000;
+
+        $display("\n===== TEST 0: two-stage asynchronous input synchronization =====");
+        @(negedge clk); #3;
+        scl_m0 = 0; scl_m1 = 0; m_low = 2'b11;
+        slave_test_low = 8'hFF; i2c_master_sel = 1;
+        @(posedge clk); #1;
+        check(dut.scl_sync === 2'b11 && dut.sda_sync === 10'h3FF,
+              "pins cannot bypass first CDC stage");
+        check(dut.master_sel_sync === 1'b0, "master select first CDC stage");
+        @(posedge clk); #1;
+        check(dut.scl_sync === 2'b00 && dut.sda_sync === 10'h000,
+              "all SCL/SDA pins have two CDC stages");
+        check(dut.master_sel_sync === 1'b1, "master select second CDC stage");
+        repeat(4) @(posedge clk);
+        #1;
+        check(!dut.m0_busy && !dut.m1_busy,
+              "SDA and SCL falling together is not START");
+        @(negedge clk); #7;
+        scl_m0 = 1; scl_m1 = 1; m_low = 2'b00;
+        slave_test_low = 8'h00;
+        #(SDA_RISE_NS + 2000);
+        check(dut.scl_sync === 2'b11 && dut.sda_sync === 10'h3FF,
+              "all synchronized pins return high");
+        reset_n = 0; i2c_master_sel = 0;
+        #200; reset_n = 1; #2000;
 
         // ============================================================
         $display("\n===== TEST 1: 内部 slave port 寄存器(0x01) 读写 =====");
@@ -388,6 +428,29 @@ module tb_i2c_cpld_switch #(
         slave_test_low[4] = 1'b0; hp;
         check(sda_m0 === 1'b1 && sda_s[4] === 1'b1, "reverse handoff releases without feedback");
         if(SDA_RISE_NS==0) begin
+            // Sweep sub-clock phase: no filtered pulse may reach a destination.
+            for(n = 1; n < 20; n = n + 3) begin
+                @(negedge clk); #n;
+                edges_before = slave4_edges;
+                set_sda(0, 0); #60; set_sda(0, 1); #400;
+                check(slave4_edges == edges_before, "master low glitch has no output edges");
+                @(negedge clk); #n;
+                edges_before = master0_edges;
+                slave_test_low[4] = 1; #60; slave_test_low[4] = 0; #400;
+                check(master0_edges == edges_before, "slave low glitch has no output edges");
+            end
+            set_sda(0, 0); hp;
+            edges_before = slave4_edges;
+            set_sda(0, 1); #40; set_sda(0, 0); #400;
+            check(slave4_edges == edges_before && sda_s[4] === 1'b0,
+                  "master high glitch cannot release slave");
+            set_sda(0, 1); hp;
+            slave_test_low[4] = 1; hp;
+            edges_before = master0_edges;
+            slave_test_low[4] = 0; #40; slave_test_low[4] = 1; #400;
+            check(master0_edges == edges_before && sda_m0 === 1'b0,
+                  "slave high glitch cannot release master");
+            slave_test_low[4] = 0; hp;
             set_sda(0, 0); #60; set_sda(0, 1); #100;
             check(sda_s[4] === 1'b1, "short master low is filtered");
             hp;
@@ -450,6 +513,8 @@ module tb_i2c_cpld_switch #(
         reset_n = 0; #200; reset_n = 1; #2000;
         check(dut.slave_port_sel === 8'h00, "reset clears select");
         check(dut.active_master_sel === 1'b0, "reset clears active master");
+        check(offclock_sda_changes == 0, "SDA pin enables change only on clk");
+        check(simultaneous_drives == 0, "SDA handoff never drives both sides");
 
         $display("\n===== SUMMARY: pass=%0d fail=%0d =====", pass_cnt, fail_cnt);
         if (fail_cnt == 0) $display("PASS"); else $display("FAIL");
